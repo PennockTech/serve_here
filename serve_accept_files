@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+
+"""
+serve_accept_files: serve_here but with unauthenticate file upload
+
+Hideously dangerous, unauthenticated file upload.
+For use with trusted clients.
+Probably full of security holes.
+"""
+
+__author__ = 'phil@pennock-tech.com (Phil Pennock)'
+# pulls liberally from stdlib
+__version__ = '0.1'
+
+import argparse
+import cgi
+import http.server
+import io
+import os
+import shutil
+import sys
+import urllib
+
+
+class Error(Exception):
+    """Base class for exceptions from serve_accept_files."""
+    pass
+
+
+class UploadingHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    server_version = "UploadingHTTP/" + __version__
+    rbufsize = 0
+    env = None
+
+    def list_directory(self, path):
+        """Override regular list-directory to just offer an upload form."""
+        enc = sys.getfilesystemencoding()
+        r = []
+
+        r.append('<html>\n<head>')
+        r.append('<meta http-equiv="Content-Type" content="text/html; charset=%s">\n' % enc)
+        r.append('<title>Upload Files</title>\n</head><body>\n<h1>Upload Files</h1>\n')
+        r.append('<form enctype="multipart/form-data" method="post">')
+        r.append('<input name="file" type="file" size="60">')
+        r.append('<input type="submit" value="upload">')
+        r.append('</form>\n')
+        r.append('</body></html>\n')
+
+        encoded = '\n'.join(r).encode(enc, 'surrogateescape')
+        f = io.BytesIO()
+        f.write(encoded)
+        have = f.tell()
+        f.seek(0)
+        self.send_response(http.HTTPStatus.OK)
+        self.send_header('Content-Type', 'text/html; charset=%s' % enc)
+        self.send_header('Content-Length', str(have))
+        self.end_headers()
+        return f
+
+    def do_POST(self):
+        self.prep_fake_cgi()
+        try:
+            status, msg = self.accept_posted_data()
+            if status != http.HTTPStatus.OK:
+                print('Fail: {} {}'.format(status, msg))
+        except Exception as e:
+            raise(e)
+            print('Exception: {}'.format(e))
+            status = http.HTTPStatus.INTERNAL_SERVER_ERROR
+            msg = 'Failed to upload data.'
+
+        f = io.BytesIO()
+        f.write(msg.encode('UTF-8', 'surrogateescape'))
+        f.write(b'\n')
+        have = f.tell()
+        f.seek(0)
+        self.send_response(status)
+        self.send_header('Content-Type', 'text/plain; charset=US-ASCII')
+        self.send_header('Content-Length', str(have))
+        self.end_headers()
+        self.env = None
+        return f
+
+# http.server._url_collapse_path(path)
+
+    def prep_fake_cgi(self):
+        path, _, query = self.path.partition('?')
+        self.env = {}
+        self.env['SERVER_SOFTWARE'] = self.version_string()
+        self.env['SERVER_NAME'] = self.server.server_name
+        self.env['GATEWAY_INTERFACE'] = 'CGI/1.1'
+        self.env['SERVER_PROTOCOL'] = self.protocol_version
+        self.env['SERVER_PORT'] = str(self.server.server_port)
+        self.env['REQUEST_METHOD'] = self.command
+        self.env['PATH_INFO'] = '/upload'
+        self.env['PATH_TRANSLATED'] = '/upload'
+        self.env['SCRIPT_NAME'] = 'uploader-foo'
+        self.env['REMOTE_ADDR'] = self.client_address[0]
+        if query:
+            self.env['QUERY_STRING'] = query
+        else:
+            self.env.pop('QUERY_STRING', None)
+        if self.headers.get('content-type') is None:
+            self.env['CONTENT_TYPE'] = self.headers.get_content_type()
+        else:
+            self.env['CONTENT_TYPE'] = self.headers['content-type']
+        length = self.headers.get('content-length')
+        if length:
+            self.env['CONTENT_LENGTH'] = length
+        else:
+            self.env.pop('CONTENT_LENGTH', None)
+
+    def accept_posted_data(self):
+        form = cgi.FieldStorage(fp=self.rfile, environ=self.env)
+        if 'file' not in form:
+            print(form.keys())
+            return (http.HTTPStatus.BAD_REQUEST, 'Missing file form field.')
+        if not form['file'].file:
+            return (http.HTTPStatus.BAD_REQUEST, 'No file in file form field.')
+        if not form['file'].filename:
+            return (http.HTTPStatus.BAD_REQUEST, 'Missing filename, presuming not a file')
+        # read data, always
+        f = io.BytesIO()
+        shutil.copyfileobj(form['file'].file, f)
+        if '/' in form['file'].filename:
+            return (http.HTTPStatus.BAD_REQUEST, 'Filename malicious, ignoring')
+        f.seek(0)
+        print('Creating: {}'.format(form['file'].filename))
+        with open(form['file'].filename, 'xb') as out:
+            shutil.copyfileobj(f, out)
+        return (http.HTTPStatus.OK, 'Read file ok.')
+
+
+def _main(args, argv0):
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('-b', '--bind', action='store',
+                        default='', type=str,
+                        help='Specify alternative bind address [default listen to wildcard]')
+    parser.add_argument('-p', '--port', action='store',
+                        default=8000, type=int,
+                        help='Specify alternate port [default %(default)s]')
+    parser.add_argument('-v', '--verbose',
+                        action='count', default=0,
+                        help='Be more verbose')
+    options = parser.parse_args(args=args)
+
+    with http.server.HTTPServer((options.bind, options.port), UploadingHTTPRequestHandler) as httpd:
+        if options.verbose:
+            sa = httpd.socket.getsockname()
+            print('Serving HTTP on http://{host}:{port}/ ...'.format(host=sa[0], port=sa[1]))
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            if options.verbose:
+                print('\nkeyboard interrupt received, exiting.')
+            return 0
+
+
+if __name__ == '__main__':
+    argv0 = sys.argv[0].rsplit('/')[-1]
+    rv = _main(sys.argv[1:], argv0=argv0)
+    sys.exit(rv)
+
+# vim: set ft=python sw=2 expandtab :

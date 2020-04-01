@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+
+"""
+serve_here_more: simple python http.server with some overrides
+"""
+
+__author__ = 'phil@pennock-tech.com (Phil Pennock)'
+
+# stdlib
+import argparse
+import collections
+import datetime
+import html
+import http.server
+import io
+import mimetypes
+import os
+import pathlib
+import socket
+import sys
+import urllib.parse
+import typing
+
+# optional non-stdlib
+try:
+    import zeroconf
+    _HAVE_ZEROCONF = True
+except ImportError:
+    _HAVE_ZEROCONF = False
+
+# Later entries override earlier ones
+MY_MIMETYPE_LOCATION_GUESSES = [
+    '~/etc/services/misc/mime.types-basic',
+    '~/.personal/etc/mime.types',
+    ]
+
+EXTRA_MIME = {
+    # The ones from the base simple server first:
+    '': 'application/octet-stream',  # Default
+    '.py': 'text/plain',
+    '.c': 'text/plain',
+    '.h': 'text/plain',
+
+    # our additions
+    '.ovpn': 'application/x-openvpn-profile',
+    '.wasm': 'application/wasm',
+}
+
+COMPRESSORS = collections.OrderedDict([
+    ('.zst', 'zstd'),   # RFC 8478
+    ('.br', 'br'),      # brotli RFC 7932 (no common file extension?)
+    ('.gz', 'gzip'),
+    ('.Z', 'compress'),
+    ('.zz', 'deflate'), # no standard file extension for deflate but zlib-wrapping might use .zz per random stack overflow answer
+])
+
+
+class Error(Exception):
+    """Base class for exceptions from s."""
+    pass
+
+
+def my_mime_extensions_map():
+    """Return a MIME extensions map."""
+    # mimetypes.init() can be called repeatedly and files are cumulative as
+    # long as non-empty.  We always want it to be called at least once, even
+    # if none of our overrides is available.
+    if not mimetypes.inited:
+        mimetypes.init()  # system mime.types parsing, etc
+
+    extra_mime_files = list(filter(
+        lambda p: p.exists(),
+        [pathlib.Path(p).expanduser() for p in MY_MIMETYPE_LOCATION_GUESSES]))
+    if extra_mime_files:
+        mimetypes.init(extra_mime_files)
+
+    extensions_map = mimetypes.types_map.copy()
+    extensions_map.update(EXTRA_MIME)
+
+    return extensions_map
+
+
+class MyHandlerClass(http.server.SimpleHTTPRequestHandler):
+    """MyHandlerClass is for http.server as our dispatch system.
+
+    One of these will be instantiated at server start time and then object
+    methods used for handling each request.
+    """
+    extensions_map = my_mime_extensions_map()
+
+    def list_directory(self, path):
+        """SimpleHTTPRequestHandler.list_directory moving HTML preamble out"""
+        try:
+            entries = os.listdir(path)
+        except OSError:
+            self.send_error(http.HTTPStatus.NOT_FOUND,
+                            "No permission to list directory")
+            return None
+        entries.sort(key=lambda a: a.lower())
+        try:
+            displaypath = urllib.parse.unquote(self.path, errors='surrogatepass')
+        except UnicodeDecodeError:
+            displaypath = urllib.parse.unquote(path)
+        displaypath = html.escape(displaypath, quote=False)
+        enc = sys.getfilesystemencoding()
+        title = 'Directory listing for %s' % displaypath
+        render_parts = self.html_dir_intro(title, enc, path)
+        render_parts.append('<ul>\n')
+        for name in entries:
+            fullname = os.path.join(path, name)
+            displayname = linkname = name
+            alternate = ''
+            # Append / for directories or @ for symbolic links
+            if os.path.isdir(fullname):
+                displayname = name + "/"
+                linkname = name + "/"
+            elif os.path.islink(fullname):
+                displayname = name + "@"
+                # Note: a link to a directory displays with @ and links with /
+            else:
+                link_noext, extension = os.path.splitext(name)
+                # We don't want to offer the special link if it exists already,
+                # because we default to returning the file which exists on disk
+                # and only trying compression as a _fallback_.  Currently.
+                if extension and extension in COMPRESSORS and not os.path.exists(os.path.join(path, link_noext)):
+                    alternate='&nbsp;(<a href="%s">%s</a>)' % (
+                        urllib.parse.quote(link_noext, errors='surrogatepass'),
+                        html.escape(link_noext, quote=False),
+                    )
+            render_parts.append('<li><a href="%s">%s</a>%s</li>' % (
+                urllib.parse.quote(linkname, errors='surrogatepass'),
+                html.escape(displayname, quote=False),
+                alternate))
+        render_parts.append('</ul>\n<hr>\n</body>\n</html>\n')
+        encoded = io.BytesIO()
+        encoded.write('\n'.join(render_parts).encode(enc, 'surrogateescape'))
+        encoded_len = encoded.tell()
+        encoded.seek(0)
+        self.send_response(http.HTTPStatus.OK)
+        self.send_header("Content-type", "text/html; charset=%s" % enc)
+        self.send_header("Content-Length", str(encoded_len))
+        self.end_headers()
+        return encoded
+
+    @staticmethod
+    def html_dir_intro(title, enc, path) -> typing.List[str]:
+        """Return list of lines representing the HTML intro to a directory listing."""
+        # We might want to report the path, so I'm keeping it in the function sig
+        _ = path
+        lines = []
+        lines.append('<!DOCTYPE html>\n')
+        lines.append('<html lang="en-US"><head><meta charset="%s">\n' % enc)
+        lines.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">\n')
+        lines.append('<meta name="generator" content="serve_here_more">\n')
+        lines.append('<title>%s</title></head><body><h1>%s</h1><hr>\n' % (title, title))
+        return lines
+
+    def log_request(self, code='-', size='-'):
+        # FIXME:
+        # nb: for a 404 error, the http.server code will construct a redundant
+        # log message and I don't see a sane way to suppress just that without
+        # suppressing others ... unless I subclass and filter out based on
+        # code?
+        # For now, accept double-logging in this toy, but might want to find a
+        # better fix if re-using this logic in production.
+        if isinstance(code, http.HTTPStatus):
+            code = code.value
+        # The returned MIME type is not held in a shared variable, only a local variable
+        # in base class's send_head().  The guess_type() call is often, but not always,
+        # lightweight.  We're a tiny server for laptop-to-device serving, we might as well
+        # just grab the type again
+        path = self.translate_path(self.path)
+        if os.path.isdir(path):
+            ctype = 'text/html'
+        else:
+            ctype = self.guess_type(path)
+        comp = self.compressed if hasattr(self, 'compressed') else 'n/a'
+        # size not available sanely without being subject to yet more races
+        _log_format = '{{s="{addr}", t="{time:%Y-%m-%d %H:%M:%SZ}", req="{req}", status={status}, type="{ctype}", comp="{comp}"}},'
+        print(_log_format.format(addr=self.address_string(),
+                                 # time=self.log_date_time_string(),
+                                 time=datetime.datetime.utcnow(),
+                                 req=self.requestline,
+                                 status=code,
+                                 ctype=ctype,
+                                 comp=comp),
+              file=sys.stderr,
+              flush=True)
+
+    def translate_path(self, path):
+        npath = super().translate_path(path)
+        self.normal_path = npath
+        self.compressed_path = None
+        self.compressed = None
+        if npath.endswith("/"):
+            return npath
+        try:
+            os.stat(npath)
+            return npath
+        except FileNotFoundError:
+            pass
+        except Exception:
+            # Let whatever else might want to handle this do so "normally"
+            return npath
+
+        for extension, ctype in COMPRESSORS.items():
+            cpath = npath + extension
+            try:
+                os.stat(cpath)
+                self.compressed_path = cpath
+                self.compressed = ctype
+                return cpath
+            except Exception:
+                pass
+
+        return npath
+
+    def end_headers(self):
+        if hasattr(self, 'compressed') and self.compressed is not None:
+            self.send_header('Content-Encoding', self.compressed)
+        super().end_headers()
+
+    def guess_type(self, path):
+        # For a directory, self.normal_path != path, as we're given the index file here
+        if hasattr(self, 'compressed_path') and self.compressed_path == path:
+            return super().guess_type(self.normal_path)
+        return super().guess_type(path)
+
+
+def report_start(sockname, options, zero):
+    """Diagnostic logging for a newly listening HTTP server."""
+    d = {
+        'host': sockname[0],
+        'port': sockname[1],
+        'myhost': socket.gethostname(),
+    }
+    if zero is not None:
+        d['zeroconf'] = zero.name
+
+    def msg(first, second):
+        f0 = first.format(**d)
+        f1 = second.format(**d)
+        print('# {0:47} {1}'.format(f0, f1), file=sys.stderr)
+    msg('Starting HTTP on {host} port {port} so:', 'http://{host}:{port}/')
+    if d['host'] != '0.0.0.0':
+        return
+    msg('I am {myhost} so:', 'http://{myhost}:{port}/')
+    if zero is not None:
+        msg('Advertizing via zeroconf as:', '{zeroconf!r}')
+    elif _HAVE_ZEROCONF:
+        msg('Zeroconf disabled', 'explicitly')
+    else:
+        msg('Zeroconf disabled', 'missing libraries')
+
+    if options.quick:
+        return
+
+    if options.ipv4:
+        d['ip'] = options.ipv4
+    else:
+        # Try .home.arpa first, it means I'm at home, it's more reliable than .local which is multiple IPs across net, docker, other bridges, etc
+        lan_hn = d['myhost'].split('.', 1)[0] + '.home.arpa'
+        try:
+            d['ip'] = socket.gethostbyname(lan_hn)
+        except socket.gaierror:
+            pass
+
+    bj = d['myhost'].split('.', 1)[0] + '.local'
+    d['bonjour'] = bj
+
+    if 'ip' not in d:
+        try:
+            d['ip'] = socket.gethostbyname(d['bonjour'])
+            d['have_bonjour'] = True
+        except socket.gaierror as e:
+            d['error'] = e
+            msg('Failed to resolve {bonjour}:', '{error}')
+            return
+
+    msg('My IP is {ip} so:', 'http://{ip}:{port}/')
+
+    try:
+        if 'have_bonjour' not in d:
+            d['have_bonjour'] = bool(socket.gethostbyname(d['bonjour']))
+    except socket.gaierror:
+        pass
+
+    if d['have_bonjour']:
+        msg('Am also {bonjour} so:', 'http://{bonjour}:{port}/')
+
+
+class ZeroconfWrapper:
+    """Zeroconf/HTTP broadcast for a newly listening HTTP server."""
+
+    def __init__(self, sockname, options):
+        self.hostname = socket.gethostname().split('.', 1)[0] + '.local'
+        self.name = options.service
+        service_type = '_http._tcp.local.'
+        # Trickiness:
+        # It tooks a while to get this showing up in server browsers on
+        # iOS, eg GoodReader; the final step was using `server` to override
+        # the service name as a hostname!
+        self.info = zeroconf.ServiceInfo(
+            service_type,
+            options.service + '.' + service_type,
+            port=int(sockname[1]),
+            server=self.hostname,
+        )
+        self.handle = zeroconf.Zeroconf()
+        self.handle.register_service(self.info)
+
+    def stop(self):
+        """Shut down Zeroconf advertising."""
+        self.handle.unregister_service(self.info)
+        self.handle.close()
+
+
+def start_server(options):
+    """Start the web-server with any anciliary services."""
+    with http.server.HTTPServer(('', options.port), MyHandlerClass) as httpd:
+        zero = None
+        if _HAVE_ZEROCONF and options.service and options.service != '-':
+            zero = ZeroconfWrapper(httpd.socket.getsockname(), options)
+        report_start(httpd.socket.getsockname(), options, zero)
+        try:
+            print('# Serving ...', file=sys.stderr)
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nKeyboard interrupt received, exiting.", file=sys.stderr)
+            return 0
+        finally:
+            if zero is not None:
+                # On macOS this is fast and reliable, but on Linux I've seen weird hangs
+                # which I _think_ are in here.  Mark it so I can tell in future.
+                print('Shutting down zeroconf ... ', end='')
+                zero.stop()
+                print('done.')
+    return 1
+
+
+def _main(args, argv0):
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    parser.add_argument('-p', '--port',
+                        default=8000, type=int, nargs='?',
+                        help='Specify alternate port [default: %(default)d]')
+    parser.add_argument('-q', '--quick',
+                        action='count', default=0,
+                        help='Skip slow startup messages')
+    parser.add_argument('-4', '--ipv4',
+                        default=None, type=str,
+                        help='Override IPv4 address detection')
+    if _HAVE_ZEROCONF:
+        parser.add_argument('-s', '--service',
+                            default='Quick serve_here_more instance',
+                            help='Zeroconf service name to register, "-" or empty to disable')
+    else:
+        parser.add_argument('-s', '--service',
+                            default='',
+                            help='Ignored, missing zeroconf support library')
+    options = parser.parse_args(args=args)
+
+    return start_server(options)
+
+
+if __name__ == '__main__':
+    _ARGV0 = sys.argv[0].rsplit('/')[-1]
+    _RV = _main(sys.argv[1:], argv0=_ARGV0)
+    sys.exit(_RV)
+
+# vim: set ft=python sw=4 expandtab :

@@ -1,0 +1,39 @@
+#!/bin/sh -u
+
+CMD_NOT_FOUND=127
+PORT="${1:-8000}"
+
+python3 -m http.server "$PORT"
+ev=$?
+[ $ev -ne $CMD_NOT_FOUND ] && exit $ev
+
+python2 -m SimpleHTTPServer "$PORT"
+ev=$?
+[ $ev -ne $CMD_NOT_FOUND ] && exit $ev
+
+# We could use print with future imports, but don't know how long that
+# future import will remain around for; writing sys.version_info seems
+# more likely to be stable for a Long Time.
+version=$(
+python <<EOPY
+import sys
+sys.stdout.write(str(sys.version_info.major))
+EOPY
+)
+ev=$?
+[ $ev -eq $CMD_NOT_FOUND ] && exit $ev
+
+case $version in
+2)
+	echo >&2 'python is python2'
+	python -m SimpleHTTPServer "$PORT"
+	;;
+3)
+	echo >&2 'python is python3'
+	python -m http.server "$PORT"
+	;;
+*)
+	echo >&2 "Unknown python version '${version}'"
+	exit 1
+	;;
+esac
