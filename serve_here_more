@@ -2,24 +2,47 @@
 
 """
 serve_here_more: simple python http.server with some overrides
+
+Because Chrome keeps connections hanging around, blocking out other accesses,
+we're now a threaded HTTP server.
 """
+
+# KNOWN ISSUES:
+#  * If the remote client has a persistent connection and closes it after a
+#    request, the server raises a ConnectionResetError and renders it, whereas
+#    for that scenario this should be "normal"; might be something else
+#    GoodReader does when the browser is closed?
+#    + I'm not currently subclassing anything to do with receiving the request
+#      and am disinclined to start doing so.
+#  * The zeroconf library seems to not respond reliably to discovery requests,
+#    so I end up restarting the server to trigger a broadcast.  I could hack
+#    around this either with _method calls or scheduling non-updating updates,
+#    but that feels wrong.  For now, living with it, should investigate to see
+#    if it's a library bug with a better fix for discovery handling, or a
+#    client app bug.
 
 __author__ = 'phil@pennock-tech.com (Phil Pennock)'
 
 # stdlib
 import argparse
+import base64   # only for favicon
 import collections
 import datetime
 import html
 import http.server
 import io
+import lzma   # only for favicon
 import mimetypes
 import os
 import pathlib
 import socket
+import socketserver
 import sys
 import urllib.parse
+import threading
+import time
 import typing
+import webbrowser
 
 # optional non-stdlib
 try:
@@ -28,11 +51,26 @@ try:
 except ImportError:
     _HAVE_ZEROCONF = False
 
+try:
+    import markdown2
+    _HAVE_MARKDOWN2 = True
+except ImportError:
+    _HAVE_MARKDOWN2 = False
+if _HAVE_MARKDOWN2:
+    try:
+        import pygments.formatters
+        _HAVE_PYGMENTS = True
+    except ImportError:
+        _HAVE_PYGMENTS = False
+
+# Path components and filenames matching these will not be served.
+EXCLUDE_DIRENTRIES = {'.git', '.env'}
+
 # Later entries override earlier ones
 MY_MIMETYPE_LOCATION_GUESSES = [
     '~/etc/services/misc/mime.types-basic',
     '~/.personal/etc/mime.types',
-    ]
+]
 
 EXTRA_MIME = {
     # The ones from the base simple server first:
@@ -44,15 +82,42 @@ EXTRA_MIME = {
     # our additions
     '.ovpn': 'application/x-openvpn-profile',
     '.wasm': 'application/wasm',
+    #
+    '.go': 'text/plain',
+    '.rs': 'text/plain',
 }
 
 COMPRESSORS = collections.OrderedDict([
-    ('.zst', 'zstd'),   # RFC 8478
-    ('.br', 'br'),      # brotli RFC 7932 (no common file extension?)
+    ('.zst', 'zstd'),    # RFC 8478
+    ('.br', 'br'),       # brotli RFC 7932 (no common file extension?)
     ('.gz', 'gzip'),
     ('.Z', 'compress'),
-    ('.zz', 'deflate'), # no standard file extension for deflate but zlib-wrapping might use .zz per random stack overflow answer
+    ('.zz', 'deflate'),  # no standard file extension for deflate but zlib-wrapping might use .zz per random stack overflow answer
 ])
+
+HTML_CONVERTERS = {}  # string values should be render_${value} methods on the request class
+if _HAVE_MARKDOWN2:
+    HTML_CONVERTERS['.md'] = 'markdown'
+    HTML_CONVERTERS['.MD'] = 'markdown'
+    MD2_EXTENSIONS = [
+        'code-friendly',       # disable intra-word emphasis
+        'cuddled-lists',       # don't need blank line before list
+        'fenced-code-blocks',  # ``` blocks
+        'footnotes',
+        'header-ids',          # add a name slug links
+        'numbering',
+        'smarty-pants',
+        'spoiler',
+        'strike',
+        'tables',              # github style rather than google wiki style
+        'task_list',           # github task lists
+        # Could add `link-patterns` and link_patterns param to auto-linkify issues, etc
+    ]
+    HTML_MD_CSS_STYLE = 'solarized-light'
+INTERNAL_PATHS = {  # string values should be builtin_${value} methods on the request class
+    '/.internal/md.css': 'md_css',
+    '/favicon.ico': 'favicon',
+}
 
 
 class Error(Exception):
@@ -107,27 +172,34 @@ class MyHandlerClass(http.server.SimpleHTTPRequestHandler):
         render_parts = self.html_dir_intro(title, enc, path)
         render_parts.append('<ul>\n')
         for name in entries:
+            if name in EXCLUDE_DIRENTRIES:
+                render_parts.append('<li><span class="direntry">%s</span></li>' % urllib.parse.quote(name, errors='surrogatepass'))
+                continue
             fullname = os.path.join(path, name)
             displayname = linkname = name
             alternate = ''
+            is_dir = os.path.isdir(fullname)
+            link_noext, extension = os.path.splitext(name)
             # Append / for directories or @ for symbolic links
-            if os.path.isdir(fullname):
+            if is_dir:
                 displayname = name + "/"
                 linkname = name + "/"
             elif os.path.islink(fullname):
                 displayname = name + "@"
                 # Note: a link to a directory displays with @ and links with /
             else:
-                link_noext, extension = os.path.splitext(name)
                 # We don't want to offer the special link if it exists already,
                 # because we default to returning the file which exists on disk
                 # and only trying compression as a _fallback_.  Currently.
                 if extension and extension in COMPRESSORS and not os.path.exists(os.path.join(path, link_noext)):
-                    alternate='&nbsp;(<a href="%s">%s</a>)' % (
+                    alternate += '&nbsp;(<a href="%s">%s</a>)' % (
                         urllib.parse.quote(link_noext, errors='surrogatepass'),
                         html.escape(link_noext, quote=False),
                     )
-            render_parts.append('<li><a href="%s">%s</a>%s</li>' % (
+            if (not is_dir) and extension in HTML_CONVERTERS:
+                alternate += '&nbsp;(<a href="%s?tohtml">html</a>)' % urllib.parse.quote(name, errors='surrogatepass')
+                pass
+            render_parts.append('<li><a href="%s" class="direntry">%s</a>%s</li>' % (
                 urllib.parse.quote(linkname, errors='surrogatepass'),
                 html.escape(displayname, quote=False),
                 alternate))
@@ -136,14 +208,43 @@ class MyHandlerClass(http.server.SimpleHTTPRequestHandler):
         encoded.write('\n'.join(render_parts).encode(enc, 'surrogateescape'))
         encoded_len = encoded.tell()
         encoded.seek(0)
-        self.send_response(http.HTTPStatus.OK)
+        self.send_response_size(http.HTTPStatus.OK, size=encoded_len)
         self.send_header("Content-type", "text/html; charset=%s" % enc)
         self.send_header("Content-Length", str(encoded_len))
         self.end_headers()
         return encoded
 
+    def do_GET(self):
+        data = None
+        path, _, query = self.path.partition('?')
+
+        reject = set(path.split('/')).intersection(EXCLUDE_DIRENTRIES)
+        if reject:
+            self.send_response_size(http.HTTPStatus.FORBIDDEN, size=0, error=' '.join(reject))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if query:
+            q = urllib.parse.parse_qs(query, keep_blank_values=True)
+            if 'tohtml' in q:
+                _, extension = os.path.splitext(path)
+                if extension in HTML_CONVERTERS:
+                    data = getattr(self, 'render_' + HTML_CONVERTERS[extension])(path)
+        elif path in INTERNAL_PATHS:  # no query params with internal paths (for now)
+            data = getattr(self, 'builtin_' + INTERNAL_PATHS[path])(path)
+
+        if data is not None:
+            try:
+                self.copyfile(data, self.wfile)
+            finally:
+                data.close()
+                return
+
+        super().do_GET()
+
     @staticmethod
-    def html_dir_intro(title, enc, path) -> typing.List[str]:
+    def html_dir_intro(title, enc, path, *, headers=None) -> typing.List[str]:
         """Return list of lines representing the HTML intro to a directory listing."""
         # We might want to report the path, so I'm keeping it in the function sig
         _ = path
@@ -152,10 +253,12 @@ class MyHandlerClass(http.server.SimpleHTTPRequestHandler):
         lines.append('<html lang="en-US"><head><meta charset="%s">\n' % enc)
         lines.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">\n')
         lines.append('<meta name="generator" content="serve_here_more">\n')
+        if headers is not None:
+            lines.extend(headers)
         lines.append('<title>%s</title></head><body><h1>%s</h1><hr>\n' % (title, title))
         return lines
 
-    def log_request(self, code='-', size='-'):
+    def log_request(self, code='-', size='-', error=None):
         # FIXME:
         # nb: for a 404 error, the http.server code will construct a redundant
         # log message and I don't see a sane way to suppress just that without
@@ -176,14 +279,30 @@ class MyHandlerClass(http.server.SimpleHTTPRequestHandler):
             ctype = self.guess_type(path)
         comp = self.compressed if hasattr(self, 'compressed') else 'n/a'
         # size not available sanely without being subject to yet more races
-        _log_format = '{{s="{addr}", t="{time:%Y-%m-%d %H:%M:%SZ}", req="{req}", status={status}, type="{ctype}", comp="{comp}"}},'
-        print(_log_format.format(addr=self.address_string(),
-                                 # time=self.log_date_time_string(),
-                                 time=datetime.datetime.utcnow(),
-                                 req=self.requestline,
-                                 status=code,
-                                 ctype=ctype,
-                                 comp=comp),
+        log_parts = [f2 for f2 in [f.lstrip() for f in r'''
+            s="{addr}"
+            t="{time:%Y-%m-%d %H:%M:%SZ}"
+            req="{req}"
+            status={status}
+            type="{ctype}"
+        '''.split('\n')] if f2]
+        if comp is not None:
+            log_parts.append('comp="{comp}"')
+        if size is not None and size != '-':
+            log_parts.append('size="{size}"')
+        if error is not None:
+            log_parts.append('error="{error}"')
+        log_format = '{{' + ', '.join(log_parts) + '}}'
+        print(log_format.format(addr=self.address_string(),
+                                # time=self.log_date_time_string(),
+                                time=datetime.datetime.utcnow(),
+                                req=self.requestline,
+                                status=code,
+                                ctype=ctype,
+                                comp=comp,
+                                size=size,
+                                error=error
+                                ),
               file=sys.stderr,
               flush=True)
 
@@ -226,6 +345,75 @@ class MyHandlerClass(http.server.SimpleHTTPRequestHandler):
             return super().guess_type(self.normal_path)
         return super().guess_type(path)
 
+    def send_response_size(self, code, *, size, message=None, error=None):
+        self.log_request(code=code, size=size, error=error)
+        self.send_response_only(code, message)
+        self.send_header('Server', self.version_string())
+        self.send_header('Date', self.date_time_string())
+
+    def render_markdown(self, path):
+        encoded = io.BytesIO()
+        enc = 'UTF-8'
+        if not _HAVE_MARKDOWN2:
+            lines = self.html_dir_intro('Missing markdown2', enc, path)
+            lines.append('<p>Missing markdown2 dependency, conversion not available</p>\n')
+            lines.append('</html>\n')
+            encoded.write(''.join(lines).encode(enc, 'surrogateescape'))
+            status = http.HTTPStatus.SERVICE_UNAVAILABLE
+        else:
+            headers = []
+            if _HAVE_PYGMENTS:
+                headers.append('<link rel="stylesheet" href="/.internal/md.css">\n')
+            md = markdown2.markdown_path(self.translate_path(path), encoding=enc, extras=MD2_EXTENSIONS)
+            preamble = self.html_dir_intro(os.path.basename(path), enc, path, headers=headers)
+            encoded.write(''.join(preamble).encode(enc, 'surrogateescape'))
+            encoded.write(md.encode(enc, 'surrogateescape'))
+            encoded.write('</body></html>\n'.encode(enc, 'surrogateescape'))
+            status = http.HTTPStatus.OK
+
+        encoded_len = encoded.tell()
+        encoded.seek(0)
+        self.send_response_size(status, size=encoded_len)
+        self.send_header("Content-type", "text/html; charset=%s" % enc)
+        self.send_header("Content-Length", str(encoded_len))
+        self.end_headers()
+        return encoded
+
+    def builtin_md_css(self, path):
+        _ = path
+        if not _HAVE_PYGMENTS:
+            self.send_response_size(http.HTTPStatus.INTERNAL_SERVER_ERROR, size=0)
+            return io.BytesIO()
+        fmter = pygments.formatters.get_formatter_by_name('html', style=HTML_MD_CSS_STYLE)
+        encoded = io.BytesIO()
+        enc = 'UTF-8'
+        encoded.write(fmter.get_style_defs().encode(enc, 'surrogateescape'))
+        encoded_len = encoded.tell()
+        encoded.seek(0)
+        self.send_response_size(http.HTTPStatus.OK, size=encoded_len)
+        self.send_header("Content-type", "text/css")
+        self.send_header("Content-Length", str(encoded_len))
+        self.end_headers()
+        return encoded
+
+    def builtin_favicon(self, path):
+        try:
+            os.stat(self.translate_path(path))
+            return super().do_GET()
+        except FileNotFoundError:
+            pass
+        if STATIC_BASE64_XZ_FAVICON is None:
+            raise Exception('missing data STATIC_BASE64_XZ_FAVICON')
+        encoded = io.BytesIO()
+        encoded.write(lzma.LZMADecompressor().decompress(base64.b64decode(STATIC_BASE64_XZ_FAVICON)))
+        encoded_len = encoded.tell()
+        encoded.seek(0)
+        self.send_response_size(http.HTTPStatus.OK, size=encoded_len)
+        self.send_header("Content-type", "image/vnd.microsoft.icon")
+        self.send_header("Content-Length", str(encoded_len))
+        self.end_headers()
+        return encoded
+
 
 def report_start(sockname, options, zero):
     """Diagnostic logging for a newly listening HTTP server."""
@@ -258,7 +446,8 @@ def report_start(sockname, options, zero):
     if options.ipv4:
         d['ip'] = options.ipv4
     else:
-        # Try .home.arpa first, it means I'm at home, it's more reliable than .local which is multiple IPs across net, docker, other bridges, etc
+        # Try .home.arpa first, it means I'm at home, it's more reliable than
+        # .local which is multiple IPs across net, docker, other bridges, etc
         lan_hn = d['myhost'].split('.', 1)[0] + '.home.arpa'
         try:
             d['ip'] = socket.gethostbyname(lan_hn)
@@ -306,7 +495,11 @@ class ZeroconfWrapper:
             port=int(sockname[1]),
             server=self.hostname,
         )
-        self.handle = zeroconf.Zeroconf()
+
+        if sockname[0] in ('0.0.0.0', '::'):
+            self.handle = zeroconf.Zeroconf()
+        else:
+            self.handle = zeroconf.Zeroconf(interfaces=[sockname[0]])
         self.handle.register_service(self.info)
 
     def stop(self):
@@ -315,27 +508,49 @@ class ZeroconfWrapper:
         self.handle.close()
 
 
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    pass
+
+
 def start_server(options):
     """Start the web-server with any anciliary services."""
-    with http.server.HTTPServer(('', options.port), MyHandlerClass) as httpd:
+    with ThreadingHTTPServer(('', options.port), MyHandlerClass) as httpd:
         zero = None
         if _HAVE_ZEROCONF and options.service and options.service != '-':
             zero = ZeroconfWrapper(httpd.socket.getsockname(), options)
         report_start(httpd.socket.getsockname(), options, zero)
+        if options.browser:
+            browse = threading.Thread(target=start_browser, args=(httpd, 0.5))
+            browse.start()
         try:
             print('# Serving ...', file=sys.stderr)
             httpd.serve_forever()
         except KeyboardInterrupt:
-            print("\nKeyboard interrupt received, exiting.", file=sys.stderr)
+            print("\n# Keyboard interrupt received, exiting.", file=sys.stderr)
+            httpd.server_close()  # threading shutdown
             return 0
         finally:
             if zero is not None:
                 # On macOS this is fast and reliable, but on Linux I've seen weird hangs
                 # which I _think_ are in here.  Mark it so I can tell in future.
-                print('Shutting down zeroconf ... ', end='')
+                print('# Shutting down zeroconf ... ', end='')
                 zero.stop()
                 print('done.')
     return 1
+
+
+def start_browser(httpd, delay):
+    ipaddr, port = httpd.socket.getsockname()
+    if ipaddr == '0.0.0.0':
+        ipaddr = '127.0.0.1'
+    elif ipaddr == '::':
+        ipaddr = '::1'
+    if ':' in ipaddr:
+        ipaddr = '[' + ipaddr + ']'
+    url = 'http://{ipaddr}:{port}/'.format(ipaddr=ipaddr, port=port)
+    print('# Browser opening: {}'.format(url), file=sys.stderr)
+    time.sleep(delay)
+    webbrowser.open_new_tab(url)
 
 
 def _main(args, argv0):
@@ -349,6 +564,9 @@ def _main(args, argv0):
     parser.add_argument('-q', '--quick',
                         action='count', default=0,
                         help='Skip slow startup messages')
+    parser.add_argument('-b', '--browser',
+                        action='store_true', default=False,
+                        help='auto-open a web-browser')
     parser.add_argument('-4', '--ipv4',
                         default=None, type=str,
                         help='Override IPv4 address detection')
@@ -364,6 +582,170 @@ def _main(args, argv0):
 
     return start_server(options)
 
+
+STATIC_BASE64_XZ_FAVICON = '''
+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
+'''
 
 if __name__ == '__main__':
     _ARGV0 = sys.argv[0].rsplit('/')[-1]
