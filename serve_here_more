@@ -472,7 +472,7 @@ def report_start(sockname, options, zero):
         if 'have_bonjour' not in d:
             d['have_bonjour'] = bool(socket.gethostbyname(d['bonjour']))
     except socket.gaierror:
-        pass
+        d['have_bonjour'] = False
 
     if d['have_bonjour']:
         msg('Am also {bonjour} so:', 'http://{bonjour}:{port}/')
